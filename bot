@@ -1,0 +1,234 @@
+import os
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
+from datetime import datetime, timedelta
+from PIL import Image
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
+BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+
+# Bot setup
+intents = discord.Intents.default()
+intents.members = True  # Required for member management
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# Warning system configurations
+user_warnings = {}  # Dictionary to store user warnings
+WARNING_THRESHOLD_MINOR = 3  # Minor infraction threshold before mute
+WARNING_THRESHOLD_MAJOR = 2  # Major infraction threshold before mute
+ESCALATION_PERIOD = timedelta(weeks=1)  # Escalation check period
+DECAY_PERIOD = timedelta(days=90)  # Warnings expire after 3 months
+COOLDOWN_PERIOD = timedelta(hours=24)  # Cooldown between warnings
+
+# Log channel ID for mod actions (set this to your actual log channel ID)
+LOG_CHANNEL_ID = YOUR_LOG_CHANNEL_ID
+OVERLAY_IMAGE_PATH = "overlay.png"  # Path to watermark image
+
+# Helper functions for warning management
+def clear_old_warnings():
+    now = datetime.utcnow()
+    for user_id in list(user_warnings.keys()):
+        user_warnings[user_id]["warnings"] = [
+            warning for warning in user_warnings[user_id]["warnings"]
+            if now - warning["timestamp"] < DECAY_PERIOD
+        ]
+        if not user_warnings[user_id]["warnings"]:
+            del user_warnings[user_id]
+
+def can_warn_user(user_id):
+    now = datetime.utcnow()
+    user_data = user_warnings.get(user_id, {"last_warned": None})
+    last_warned = user_data.get("last_warned")
+    return not last_warned or (now - last_warned) > COOLDOWN_PERIOD
+
+def create_log_embed(action, mod, target, infraction_level, reason, message_link=None):
+    embed = discord.Embed(title=f"{action} Issued", color=discord.Color.red())
+    embed.add_field(name="Moderator", value=mod.mention, inline=True)
+    embed.add_field(name="User", value=target.mention, inline=True)
+    embed.add_field(name="Infraction Level", value=infraction_level, inline=True)
+    embed.add_field(name="Reason", value=reason, inline=False)
+    if message_link:
+        embed.add_field(name="Message Link", value=message_link, inline=False)
+    embed.set_footer(text=f"Action issued at {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    return embed
+
+# Slash command: warn users with infraction level
+@bot.tree.command(name="warn", description="Warn a user with an infraction level.")
+@app_commands.describe(
+    member="User to warn",
+    level="Infraction level (minor or major)",
+    reason="Reason for the warning",
+    message_link="Link to relevant message"
+)
+@app_commands.choices(
+    level=[
+        app_commands.Choice(name="Minor", value="minor"),
+        app_commands.Choice(name="Major", value="major"),
+    ]
+)
+@app_commands.checks.has_permissions(moderate_members=True)
+async def warn(interaction: discord.Interaction, member: discord.Member, level: app_commands.Choice[str], reason: str, message_link: str = None):
+    if not can_warn_user(member.id):
+        await interaction.response.send_message("This user has recently been warned. Please wait before warning again.", ephemeral=True)
+        return
+
+    # Initialize user warning data if not present
+    if member.id not in user_warnings:
+        user_warnings[member.id] = {"warnings": [], "last_warned": None}
+
+    # Record the warning
+    now = datetime.utcnow()
+    warning = {"level": level.value, "timestamp": now, "reason": reason, "moderator": interaction.user.id, "message_link": message_link}
+    user_warnings[member.id]["warnings"].append(warning)
+    user_warnings[member.id]["last_warned"] = now
+
+    # DM user about the warning
+    dm_message = f"You have received a {level.name.lower()} infraction warning for the following reason:\n\n**{reason}**\n\nPlease avoid further infractions to prevent additional action."
+    await member.send(dm_message)
+
+    # Log the warning to mod channel
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    log_embed = create_log_embed("Warning", interaction.user, member, level.name.capitalize(), reason, message_link)
+    await log_channel.send(embed=log_embed)
+
+    # Check for escalation
+    warning_count = len([w for w in user_warnings[member.id]["warnings"] if now - w["timestamp"] < ESCALATION_PERIOD and w["level"] == level.value])
+    if (level.value == "minor" and warning_count >= WARNING_THRESHOLD_MINOR) or (level.value == "major" and warning_count >= WARNING_THRESHOLD_MAJOR):
+        mute_duration = timedelta(hours=24 if level.value == "minor" else 72)
+        await member.edit(timed_out_until=now + mute_duration, reason="Reached warning threshold for infractions")
+        escalation_message = f"{member.mention} has been timed out for {mute_duration.total_seconds() // 3600} hours due to accumulating multiple {level.name.lower()} warnings."
+        await log_channel.send(escalation_message)
+        user_warnings[member.id]["warnings"] = []
+
+    # Confirmation response
+    await interaction.response.send_message(f"{member.mention} has been warned with a {level.name.lower()} infraction.", ephemeral=True)
+
+# Command: Reset warnings for a user
+@bot.tree.command(name="warn_reset", description="Reset warnings for a user.")
+@app_commands.describe(member="The member whose warnings to reset")
+@app_commands.checks.has_permissions(administrator=True)
+async def warn_reset(interaction: discord.Interaction, member: discord.Member):
+    if member.id in user_warnings:
+        del user_warnings[member.id]
+    await interaction.response.send_message(f"{member.mention}'s warnings have been reset.", ephemeral=True)
+
+# Slash command: check warning summary
+@bot.tree.command(name="summary", description="Check a user's warnings and infractions.")
+@app_commands.describe(member="The member to get the summary for")
+async def summary(interaction: discord.Interaction, member: discord.Member):
+    warnings = user_warnings.get(member.id, {}).get("warnings", [])
+    embed = discord.Embed(title=f"Warnings Summary for {member}", color=discord.Color.blue())
+    embed.add_field(name="Total Warnings", value=len(warnings), inline=True)
+
+    for idx, warning in enumerate(warnings, start=1):
+        mod_user = await bot.fetch_user(warning["moderator"])
+        timestamp = warning["timestamp"].strftime('%Y-%m-%d %H:%M:%S UTC')
+        embed.add_field(
+            name=f"Warning {idx} ({warning['level'].capitalize()})",
+            value=f"Reason: {warning['reason']}\nModerator: {mod_user.mention}\nDate: {timestamp}",
+            inline=False
+        )
+
+    await interaction.response.send_message(embed=embed)
+
+# Auto-clear expired warnings every 24 hours
+@tasks.loop(hours=24)
+async def reset_warnings():
+    clear_old_warnings()
+
+# Moderation Commands: Timeout, Kick, Ban
+@bot.tree.command(name="timeout", description="Timeout a user for a specified duration.")
+@app_commands.describe(member="User to timeout", duration="Duration in minutes", reason="Reason for timeout")
+@app_commands.checks.has_permissions(moderate_members=True)
+async def timeout(interaction: discord.Interaction, member: discord.Member, duration: int, reason: str):
+    until = discord.utils.utcnow() + timedelta(minutes=duration)
+    await member.edit(timed_out_until=until, reason=reason)
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    log_embed = create_log_embed("Timeout", interaction.user, member, f"{duration} minutes", reason)
+    await log_channel.send(embed=log_embed)
+    await interaction.response.send_message(f"{member.mention} has been timed out for {duration} minutes.", ephemeral=True)
+
+@bot.tree.command(name="kick", description="Kick a user from the server.")
+@app_commands.describe(member="User to kick", reason="Reason for kick")
+@app_commands.checks.has_permissions(kick_members=True)
+async def kick(interaction: discord.Interaction, member: discord.Member, reason: str):
+    await member.kick(reason=reason)
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    log_embed = create_log_embed("Kick", interaction.user, member, reason=reason)
+    await log_channel.send(embed=log_embed)
+    await interaction.response.send_message(f"{member.mention} has been kicked.", ephemeral=True)
+
+@bot.tree.command(name="ban", description="Ban a user from the server.")
+@app_commands.describe(member="User to ban", reason="Reason for ban")
+@app_commands.checks.has_permissions(ban_members=True)
+async def ban(interaction: discord.Interaction, member: discord.Member, reason: str):
+    await member.ban(reason=reason)
+    log_channel = bot.get_channel(LOG_CHANNEL_ID)
+    log_embed = create_log_embed("Ban", interaction.user, member, reason=reason)
+    await log_channel.send(embed=log_embed)
+    await interaction.response.send_message(f"{member.mention} has been banned.", ephemeral=True)
+
+# Command for responding to applications
+@bot.tree.command(name="application_response", description="Send a response to a user's team application.")
+@app_commands.describe(
+    user="The user to send the response to",
+    team="The team they're applying for (Event, Leaker, Staff)",
+    status="The application status (Accepted or Rejected)",
+    mod_note="Optional note for the application"
+)
+@app_commands.choices(
+    team=[
+        app_commands.Choice(name="Event", value="Event"),
+        app_commands.Choice(name="Leaker", value="Leaker"),
+        app_commands.Choice(name="Staff", value="Staff"),
+    ],
+    status=[
+        app_commands.Choice(name="Accepted", value="Accepted"),
+        app_commands.Choice(name="Rejected", value="Rejected"),
+    ]
+)
+@app_commands.checks.has_permissions(manage_roles=True)
+async def application_response(
+    interaction: discord.Interaction,
+    user: discord.User,
+    team: app_commands.Choice[str],
+    status: app_commands.Choice[str],
+    mod_note: str = None
+):
+    # Create an embed for the DM
+    embed = discord.Embed(
+        title=f"{team.value} Team Application",
+        color=discord.Color.green() if status.value == "Accepted" else discord.Color.red()
+    )
+    embed.description = (
+        f"Your application for the **{team.value} Team** has been **{status.value.lower()}** by **{interaction.user.mention}**.\n\n"
+        f"We appreciate your interest in joining the team and value the time you took to apply. "
+        f"Should you have any questions about the decision, feel free to reach out.\n\n"
+        f"{f'**Mod Note:** {mod_note}' if mod_note else ''}"
+    )
+
+    try:
+        # Send the DM to the user
+        await user.send(embed=embed)
+        await interaction.response.send_message(
+            f"Application response sent to {user.mention} for the {team.value} team application.", ephemeral=True
+        )
+    except discord.Forbidden:
+        # Notify the moderator if the DM could not be sent
+        await interaction.response.send_message(
+            f"Could not send a DM to {user.mention}. They may have DMs disabled.", ephemeral=True
+        )
+
+# Error handler for missing permissions
+@bot.tree.error
+async def on_app_command_error(interaction: discord.Interaction, error):
+    if isinstance(error, app_commands.errors.MissingPermissions):
+        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
+
+# Run the bot
+bot.run(BOT_TOKEN)
