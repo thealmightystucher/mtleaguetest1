@@ -10,9 +10,14 @@ from dotenv import load_dotenv
 load_dotenv()
 BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
 
+# Check if the bot token is loaded correctly
+if not BOT_TOKEN:
+    print("Error: DISCORD_BOT_TOKEN not set.")
+
 # Bot setup
 intents = discord.Intents.default()
 intents.members = True  # Required for member management
+intents.message_content = True  # Required for reading messages if needed
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # Warning system configurations
@@ -171,64 +176,17 @@ async def ban(interaction: discord.Interaction, member: discord.Member, reason: 
     await log_channel.send(embed=log_embed)
     await interaction.response.send_message(f"{member.mention} has been banned.", ephemeral=True)
 
-# Command for responding to applications
-@bot.tree.command(name="application_response", description="Send a response to a user's team application.")
-@app_commands.describe(
-    user="The user to send the response to",
-    team="The team they're applying for (Event, Leaker, Staff)",
-    status="The application status (Accepted or Rejected)",
-    mod_note="Optional note for the application"
-)
-@app_commands.choices(
-    team=[
-        app_commands.Choice(name="Event", value="Event"),
-        app_commands.Choice(name="Leaker", value="Leaker"),
-        app_commands.Choice(name="Staff", value="Staff"),
-    ],
-    status=[
-        app_commands.Choice(name="Accepted", value="Accepted"),
-        app_commands.Choice(name="Rejected", value="Rejected"),
-    ]
-)
-@app_commands.checks.has_permissions(manage_roles=True)
-async def application_response(
-    interaction: discord.Interaction,
-    user: discord.User,
-    team: app_commands.Choice[str],
-    status: app_commands.Choice[str],
-    mod_note: str = None
-):
-    # Create an embed for the DM
-    embed = discord.Embed(
-        title=f"{team.value} Team Application",
-        color=discord.Color.green() if status.value == "Accepted" else discord.Color.red()
-    )
-    embed.description = (
-        f"Your application for the **{team.value} Team** has been **{status.value.lower()}** by **{interaction.user.mention}**.\n\n"
-        f"We appreciate your interest in joining the team and value the time you took to apply. "
-        f"Should you have any questions about the decision, feel free to reach out.\n\n"
-        f"{f'**Mod Note:** {mod_note}' if mod_note else ''}"
-    )
+# Event when the bot is ready
+@bot.event
+async def on_ready():
+    print(f'We have logged in as {bot.user}')
+    await bot.tree.sync()  # Syncs slash commands to Discord
+    reset_warnings.start()
 
-    try:
-        # Send the DM to the user
-        await user.send(embed=embed)
-        await interaction.response.send_message(
-            f"Application response sent to {user.mention} for the {team.value} team application.", ephemeral=True
-        )
-    except discord.Forbidden:
-        # Notify the moderator if the DM could not be sent
-        await interaction.response.send_message(
-            f"Could not send a DM to {user.mention}. They may have DMs disabled.", ephemeral=True
-        )
-
-# Error handler for missing permissions
-@bot.tree.error
-async def on_app_command_error(interaction: discord.Interaction, error):
-    if isinstance(error, app_commands.errors.MissingPermissions):
-        await interaction.response.send_message("You don't have permission to use this command.", ephemeral=True)
-    else:
-        await interaction.response.send_message(f"An error occurred: {error}", ephemeral=True)
+# Event when a shard connects
+@bot.event
+async def on_shard_connect(shard_id):
+    print(f"Shard {shard_id} has connected!")
 
 # Run the bot
 bot.run(BOT_TOKEN)
