@@ -2,7 +2,7 @@ import os
 import discord
 from discord import app_commands
 from discord.ext import commands
-from PIL import Image
+from PIL import Image, ImageOps
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -76,13 +76,7 @@ class PingView(discord.ui.View):
 async def ping(interaction: discord.Interaction):
     await interaction.response.send_message("Choose a role to ping:", view=PingView(), ephemeral=True)
 
-# Directory to save uploaded images temporarily
-TEMP_IMAGE_DIR = "images"
-
-# Ensure the directory exists
-if not os.path.exists(TEMP_IMAGE_DIR):
-    os.makedirs(TEMP_IMAGE_DIR)
-
+# Command: watermark
 @bot.tree.command(name="watermark", description="overlay a watermark on an uploaded image")
 @app_commands.describe(image="upload an image to apply the watermark")
 async def watermark(interaction: discord.Interaction, image: discord.Attachment):
@@ -95,15 +89,36 @@ async def watermark(interaction: discord.Interaction, image: discord.Attachment)
 
     try:
         # Save and process the uploaded image in the local directory
+        TEMP_IMAGE_DIR = "images"
+        if not os.path.exists(TEMP_IMAGE_DIR):
+            os.makedirs(TEMP_IMAGE_DIR)
+
         image_path = os.path.join(TEMP_IMAGE_DIR, image.filename)
         await image.save(image_path)
-        
+
+        # Open the base and overlay images
         base_image = Image.open(image_path)
         overlay_image = Image.open(OVERLAY_IMAGE_PATH).convert("RGBA")
 
-        # Resize and apply the watermark
-        overlay_image = overlay_image.resize(base_image.size)
-        combined_image = Image.alpha_composite(base_image.convert("RGBA"), overlay_image)
+        # Calculate the scale factor for even stretching
+        base_width, base_height = base_image.size
+        overlay_width, overlay_height = overlay_image.size
+
+        # Uniform scaling factor for even stretching
+        scale_factor = min(base_width / overlay_width, base_height / overlay_height)
+        new_width = int(overlay_width * scale_factor)
+        new_height = int(overlay_height * scale_factor)
+
+        # Resize overlay to match the calculated dimensions
+        overlay_image = overlay_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+        # Center the overlay on the base image
+        overlay_position = (
+            (base_width - new_width) // 2,
+            (base_height - new_height) // 2
+        )
+        combined_image = base_image.convert("RGBA")
+        combined_image.paste(overlay_image, overlay_position, overlay_image)
 
         # Save the watermarked image
         output_path = os.path.join(TEMP_IMAGE_DIR, f"watermarked_{image.filename}")
