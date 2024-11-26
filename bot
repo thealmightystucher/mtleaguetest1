@@ -1,13 +1,34 @@
 import os
+import tempfile
 import discord
 from discord import app_commands
-from discord.ext import commands
-from PIL import Image, ImageOps
+from discord.ext import commands, tasks
+import aiohttp
+from datetime import datetime, timedelta
+from pytz import timezone
+from PIL import Image
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
+DISCORD_CHANNEL_ID = 1309871946887860284  # Replace with your Discord channel ID
+PING_ROLE_ID = 1309872874139684955  # Role to ping when a game updates
+POLLS_ROLE_ID = 1237314912829571155  # Extra role to ping
+
+# Roblox game universe IDs
+GAMES_TO_TRACK = {
+    2788648141: "Military Tycoon",
+    5132638887: "Live Staging",
+    3284854873: "Public Test"
+}
+
+# Cooldowns and last update tracking
+ping_cooldowns = {}
+last_update_times = {universe_id: None for universe_id in GAMES_TO_TRACK}
+
+# Overlay image path for watermark
+OVERLAY_IMAGE_PATH = "overlay.png"
 
 # Bot setup
 intents = discord.Intents.default()
@@ -15,199 +36,268 @@ intents.guilds = True
 intents.members = True
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# Path to the overlay image for watermarking
-OVERLAY_IMAGE_PATH = "overlay.png"  # Ensure this image exists in the bot's directory
+# Fetch game data from Roblox API
+async def fetch_game_data(universe_id):
+    url = f"https://games.roblox.com/v1/games?universeIds={universe_id}"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url) as response:
+            if response.status == 200:
+                data = await response.json()
+                if 'data' in data and len(data['data']) > 0:
+                    return data['data'][0]
+                else:
+                    print(f"No data found for Universe ID {universe_id}.")
+                    return None
+            else:
+                print(f"Failed to fetch data for Universe ID {universe_id}. Status: {response.status}")
+                return None
 
-# Role IDs
-EVENT_PING_ROLE_ID = 1242872145277747281
-LEAK_PING_ROLE_ID = 1230629514468392960
-EVENT_PING_PERMISSION_ROLE_ID = 1242172129664045146
-LEAK_PING_PERMISSION_ROLE_ID = 1243877817561911406
+# Periodic check for Roblox game updates
+@tasks.loop(minutes=5)
+async def check_game_updates():
+    global last_update_times
+    eest = timezone("Europe/Helsinki")
+    now_eest = datetime.now(eest)
+    for universe_id, game_name in GAMES_TO_TRACK.items():
+        game_data = await fetch_game_data(universe_id)
+        if not game_data:
+            print(f"Skipping {game_name} due to missing data.")
+            continue
 
-@bot.event
-async def on_ready():
-    print("Ready")  # Prints when the bot is connected and ready
-    # Set bot status
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.watching, name="over MT LEAGUE"))
+        updated_time = datetime.strptime(game_data['updated'], "%Y-%m-%dT%H:%M:%S.%fZ")
+        if last_update_times[universe_id] is None:
+            last_update_times[universe_id] = updated_time
+            print(f"Monitoring '{game_name}' for updates.")
+        elif updated_time > last_update_times[universe_id]:
+            last_update_times[universe_id] = updated_time
+            channel = bot.get_channel(DISCORD_CHANNEL_ID)
+            if channel:
+                if universe_id == 2788648141:  # Military Tycoon
+                    if now_eest.weekday() == 5:  # Check if today is Saturday (0=Monday, 5=Saturday)
+                        await channel.send(
+                            f"🔔 **{game_name}** has been updated!\n"
+                            f"Last Updated: {updated_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                            f"<@&{PING_ROLE_ID}>"
+                        )
+                else:  # Other games
+                    await channel.send(
+                        f"🔔 **{game_name}** has been updated!\n"
+                        f"Last Updated: {updated_time.strftime('%Y-%m-%d %H:%M:%S UTC')}\n"
+                        f"<@&{PING_ROLE_ID}>"
+                    )
 
-# Use setup_hook to sync commands only once when the bot starts up
-async def setup_hook():
-    await bot.tree.sync()
-    print("Commands synced with Discord.")
-
-# Set the setup_hook
-bot.setup_hook = setup_hook
-
-# Command: ping
+# Ping command with confirmation and cooldown
+# PingSelect must be defined before PingView
 class PingSelect(discord.ui.Select):
-    def __init__(self):
+    def __init__(self, interaction):
+        self.interaction = interaction
         options = [
-            discord.SelectOption(label="Event", description="Ping the event role"),
-            discord.SelectOption(label="Leak", description="Ping the leak role")
+            discord.SelectOption(label="Event", description="Event Ping"),
+            discord.SelectOption(label="Leak", description="Leak Ping"),
+            discord.SelectOption(label="Polls", description="Polls Ping")
         ]
-        super().__init__(placeholder="Select an option to ping", min_values=1, max_values=1, options=options)
+        super().__init__(placeholder="Select a role to ping", options=options)
 
     async def callback(self, interaction: discord.Interaction):
-        member = interaction.user
-        selected_option = self.values[0]
+        if interaction.user.id != self.interaction.user.id:
+            await interaction.response.send_message("This action is not for you.", ephemeral=True)
+            return
 
-        # Check permissions based on the selected option
-        if selected_option == "Event":
-            if any(role.id == EVENT_PING_PERMISSION_ROLE_ID for role in member.roles):
-                event_ping_role = interaction.guild.get_role(EVENT_PING_ROLE_ID)
-                await interaction.response.send_message(f"{event_ping_role.mention}", allowed_mentions=discord.AllowedMentions(roles=True))
-            else:
-                await interaction.response.send_message("You don't have permission to ping the Event Ping role.", ephemeral=True)
+        now = datetime.utcnow()
+        if self.interaction.user.id in ping_cooldowns:
+            remaining_time = ping_cooldowns[self.interaction.user.id] - now
+            if remaining_time.total_seconds() > 0:
+                minutes, seconds = divmod(remaining_time.total_seconds(), 60)
+                await interaction.response.send_message(
+                    f"You are on cooldown. Try again in {int(minutes)} minutes and {int(seconds)} seconds.",
+                    ephemeral=True,
+                )
+                return
 
-        elif selected_option == "Leak":
-            if any(role.id == LEAK_PING_PERMISSION_ROLE_ID for role in member.roles):
-                leak_ping_role = interaction.guild.get_role(LEAK_PING_ROLE_ID)
-                await interaction.response.send_message(f"{leak_ping_role.mention}", allowed_mentions=discord.AllowedMentions(roles=True))
+        role_permissions = [
+            1242872145277747281,  # Event Ping Role
+            1230629514468392960,  # Leak Ping Role
+            1246911053837762672,  # Polls Ping Role
+        ]
+
+        if self.values[0] == "Polls":
+            if any(role.id in role_permissions for role in self.interaction.user.roles):
+                role_id = POLLS_ROLE_ID
             else:
-                await interaction.response.send_message("You don't have permission to ping the Leak Ping role.", ephemeral=True)
+                await interaction.response.send_message(
+                    "You don't have permission to ping polls.", ephemeral=True
+                )
+                return
+        else:
+            role_id = 1242872145277747281 if self.values[0] == "Event" else 1230629514468392960
+
+        await interaction.response.send_message(
+            "Do you want to confirm this action?",
+            view=PingConfirm(role_id=role_id, user_id=self.interaction.user.id, channel=self.interaction.channel),
+            ephemeral=True
+        )
+        ping_cooldowns[self.interaction.user.id] = now + timedelta(hours=1)
 
 
 class PingView(discord.ui.View):
-    def __init__(self):
+    def __init__(self, interaction):
         super().__init__()
-        self.add_item(PingSelect())
+        self.add_item(PingSelect(interaction))
 
-@bot.tree.command(name="ping", description="ping the event or leak role (considering you're a leaker/event team member)")
+
+class PingConfirm(discord.ui.View):
+    def __init__(self, role_id, user_id, channel):
+        super().__init__(timeout=60)
+        self.role_id = role_id
+        self.user_id = user_id
+        self.channel = channel  # Store the channel for sending the ping
+        self.message = None  # To track the message for timeouts
+
+    async def on_timeout(self):
+        """Handle timeout by disabling buttons and editing the message."""
+        for child in self.children:
+            child.disabled = True
+        if self.message:
+            await self.message.edit(content="Action timed out.", view=self)
+
+    @discord.ui.button(label="Confirm", style=discord.ButtonStyle.green)
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle the confirm button click."""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This action is not for you.", ephemeral=True)
+            return
+
+        # Retrieve the role from the guild
+        role = interaction.guild.get_role(self.role_id)
+        if not role:
+            await interaction.response.send_message("Role not found or I lack permission.", ephemeral=True)
+            return
+
+        # Send the ping message
+        await self.channel.send(f"{role.mention}", allowed_mentions=discord.AllowedMentions(roles=True))
+        await interaction.response.edit_message(content="Ping sent successfully!", view=None)
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.red)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Handle the cancel button click."""
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("This action is not for you.", ephemeral=True)
+            return
+
+        await interaction.response.edit_message(content="Canceled.", view=None)
+
+
+
+@bot.tree.command(name="ping", description="Ping event, leak, or polls")
 async def ping(interaction: discord.Interaction):
-    await interaction.response.send_message("Choose a role to ping:", view=PingView(), ephemeral=True)
+    await interaction.response.send_message("Choose a role to ping:", view=PingView(interaction), ephemeral=True)
 
-# Command: watermark
-@bot.tree.command(name="watermark", description="overlay a watermark on an uploaded image")
-@app_commands.describe(image="upload an image to apply the watermark")
-async def watermark(interaction: discord.Interaction, image: discord.Attachment):
-    if not image.content_type.startswith("image"):
-        await interaction.response.send_message(embed=discord.Embed(
-            title="Invalid Attachment", 
-            description="The attachment is not an image.", 
-            color=discord.Color.red()))
-        return
+# Watermark command
+@bot.tree.command(name="watermark", description="Overlay a watermark on an image")
+@app_commands.describe(image="Image to watermark")
+async def overlay(interaction: discord.Interaction, image: discord.Attachment):
+    await interaction.response.defer()  # Defers the response to allow processing time
 
     try:
-        # Save and process the uploaded image in the local directory
-        TEMP_IMAGE_DIR = "images"
-        if not os.path.exists(TEMP_IMAGE_DIR):
-            os.makedirs(TEMP_IMAGE_DIR)
+        # Download the user-uploaded image
+        original_image_path = tempfile.NamedTemporaryFile(delete=False, suffix=".png").name
+        await image.save(original_image_path)
 
-        image_path = os.path.join(TEMP_IMAGE_DIR, image.filename)
-        await image.save(image_path)
+        # Define watermark path (ensure this exists on your server)
+        watermark_path = "overlay.png"  # Replace with your watermark file path
 
-        # Open the base and overlay images
-        base_image = Image.open(image_path)
-        overlay_image = Image.open(OVERLAY_IMAGE_PATH).convert("RGBA")
+        # Create a temporary file for the watermarked output
+        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+        output_path = temp_output.name
+        temp_output.close()
 
-        # Calculate the scale factor for even stretching
+        # Open the images
+        base_image = Image.open(original_image_path).convert("RGBA")
+        watermark = Image.open(watermark_path).convert("RGBA")
+
+        # Get dimensions of the base image
         base_width, base_height = base_image.size
-        overlay_width, overlay_height = overlay_image.size
 
-        # Uniform scaling factor for even stretching
-        scale_factor = min(base_width / overlay_width, base_height / overlay_height)
-        new_width = int(overlay_width * scale_factor)
-        new_height = int(overlay_height * scale_factor)
+        # Scale the watermark to approximately 30% of the base image width
+        watermark_width = int(base_width * 0.80)
+        aspect_ratio = watermark.size[1] / watermark.size[0]
+        watermark_height = int(watermark_width * aspect_ratio)
 
-        # Resize overlay to match the calculated dimensions
-        overlay_image = overlay_image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        watermark_resized = watermark.resize((watermark_width, watermark_height), Image.LANCZOS)
 
-        # Center the overlay on the base image
-        overlay_position = (
-            (base_width - new_width) // 2,
-            (base_height - new_height) // 2
-        )
-        combined_image = base_image.convert("RGBA")
-        combined_image.paste(overlay_image, overlay_position, overlay_image)
+        # Calculate bottom-left position for the watermark with margin
+        margin = int(base_width * 0.02)  # 2% margin relative to the image width
+        position = (margin, base_height - watermark_height - margin)
+
+        # Overlay the watermark
+        watermarked_image = base_image.copy()
+        watermarked_image.paste(watermark_resized, position, watermark_resized)
 
         # Save the watermarked image
-        output_path = os.path.join(TEMP_IMAGE_DIR, f"watermarked_{image.filename}")
-        combined_image.save(output_path)
+        watermarked_image.save(output_path)
 
-        await interaction.response.send_message(embed=discord.Embed(
-            title="Watermark Applied", 
-            description="Here is your image with the watermark applied!", 
-            color=discord.Color.green()))
-        await interaction.followup.send(file=discord.File(output_path))
+        # Send the embed first
+        embed = discord.Embed(
+            title="Watermarked Image",
+            description="Here is your watermarked image:",
+            color=discord.Color.green()  # Set the embed color to green
+        )
+        await interaction.followup.send(embed=embed)
 
-        # Clean up the temporary files
-        os.remove(image_path)
+        # Send the image in a separate follow-up message
+        with open(output_path, "rb") as f:
+            await interaction.followup.send(file=discord.File(f, "watermarked_output.png"))
+
+        # Clean up temporary files
+        os.remove(original_image_path)
         os.remove(output_path)
 
     except Exception as e:
-        await interaction.response.send_message(f"Failed to process the image: {str(e)}", ephemeral=True)
+        # Handle any errors and clean up
+        try:
+            if os.path.exists(original_image_path):
+                os.remove(original_image_path)
+            if os.path.exists(output_path):
+                os.remove(output_path)
+        except Exception:
+            pass
 
-# Command: dm
-@bot.tree.command(name="dm", description="send a direct message to a user with optional media")
-@app_commands.describe(user="the user to send the message to", message="the message content", media="optional media attachment")
-@app_commands.checks.has_permissions(manage_roles=True)
-async def dm(interaction: discord.Interaction, user: discord.User, message: str = None, media: discord.Attachment = None):
-    try:
-        # Send message and/or media to the user
-        if message and media:
-            await user.send(content=message, file=await media.to_file())
-        elif message:
-            await user.send(content=message)
-        elif media:
-            await user.send(file=await media.to_file())
-        else:
-            await interaction.response.send_message("Please provide either a message or media to send.", ephemeral=True)
-            return
+        await interaction.followup.send(f"Failed to process the image: {e}")
+        
 
-        await interaction.response.send_message(f"Message sent to {user.mention}.", ephemeral=True)
-    except discord.Forbidden:
-        await interaction.response.send_message(f"Could not send a DM to {user.mention}. They may have DMs disabled.", ephemeral=True)
-
-# Command: appres
-@bot.tree.command(name="appres", description="send a response to a users team application")
-@app_commands.describe(
-    user="the user to send the response to",
-    team="the team they are applying for event leaker or staff",
-    status="the application status accepted or rejected",
-    mod_note="optional note for the application"
-)
+# AppRes command
+@bot.tree.command(name="appres", description="respond to a team application")
+@app_commands.describe(user="user to respond to", team="team applied for", status="application status", mod_note="optional note")
 @app_commands.choices(
     team=[
         app_commands.Choice(name="Event", value="Event"),
         app_commands.Choice(name="Leaker", value="Leaker"),
-        app_commands.Choice(name="Staff", value="Staff"),
+        app_commands.Choice(name="Staff", value="Staff")
     ],
     status=[
         app_commands.Choice(name="Accepted", value="Accepted"),
-        app_commands.Choice(name="Rejected", value="Rejected"),
+        app_commands.Choice(name="Rejected", value="Rejected")
     ]
 )
 @app_commands.checks.has_permissions(manage_roles=True)
-async def appres(
-    interaction: discord.Interaction,
-    user: discord.User,
-    team: app_commands.Choice[str],
-    status: app_commands.Choice[str],
-    mod_note: str = None
-):
-    # Create an embed for the DM
+async def appres(interaction: discord.Interaction, user: discord.User, team: app_commands.Choice[str], status: app_commands.Choice[str], mod_note: str = None):
     embed = discord.Embed(
-        title=f"{team.value} Team Application",
+        title=f"{team.value} Application",
+        description=(
+            f"Your application for the **{team.value}** team has been **{status.value.lower()}** by {interaction.user.mention}.\n\n"
+            f"{f'**Mod Note:** {mod_note}' if mod_note else ''}"
+        ),
         color=discord.Color.green() if status.value == "Accepted" else discord.Color.red()
     )
-    embed.description = (
-        f"Your application for the **{team.value} Team** has been **{status.value.lower()}** by **{interaction.user.mention}**.\n\n"
-        f"We appreciate your interest in joining the team and value the time you took to apply. "
-        f"Should you have any questions about the decision, feel free to reach out.\n\n"
-        f"{f'**Mod Note:** {mod_note}' if mod_note else ''}"
-    )
-
     try:
-        # Send the DM to the user
         await user.send(embed=embed)
-        await interaction.response.send_message(
-            f"Application response sent to {user.mention} for the {team.value} team application.", ephemeral=True
-        )
+        await interaction.response.send_message(f"Response sent to {user.mention}.", ephemeral=True)
     except discord.Forbidden:
-        # Notify the moderator if the DM could not be sent
-        await interaction.response.send_message(
-            f"Could not send a DM to {user.mention}. They may have DMs disabled.", ephemeral=True
-        )
+        await interaction.response.send_message(f"Could not DM {user.mention}.", ephemeral=True)
 
-# Run the bot
+@bot.event
+async def on_ready():
+    print("Bot is ready.")
+    check_game_updates.start()
+
 bot.run(BOT_TOKEN)
