@@ -204,7 +204,7 @@ async def overlay(interaction: discord.Interaction, image: discord.Attachment):
         await image.save(original_image_path)
 
         # Define watermark path (ensure this exists on your server)
-        watermark_path = "overlay.png"  # Replace with your watermark file path
+        watermark_path = "watermark.png"  # Replace with your watermark file path
 
         # Create a temporary file for the watermarked output
         temp_output = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
