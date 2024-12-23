@@ -12,9 +12,9 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 BOT_TOKEN = os.getenv('DISCORD_BOT_TOKEN')
-DISCORD_CHANNEL_ID = 1309871946887860284  # Replace with your Discord channel ID
+DISCORD_CHANNEL_ID = 1309871946887860284 
 PING_ROLE_ID = 1309872874139684955  # Role to ping when a game updates
-POLLS_ROLE_ID = 1237314912829571155  # Extra role to ping
+POLLS_ROLE_ID = 1237314912829571155  # Polls Role ID
 
 # Roblox game universe IDs
 GAMES_TO_TRACK = {
